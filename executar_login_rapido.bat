@@ -1,13 +1,17 @@
 @echo off
 setlocal
 
+if /I "%~1" neq "__run__" (
+    powershell -NoProfile -WindowStyle Hidden -Command "Start-Process cmd.exe -ArgumentList '/c ""%~f0"" __run__' -WindowStyle Hidden"
+    exit /b 0
+)
+
 cd /d "%~dp0"
 
 set "PHP_EXE=C:\RoboEmissor\php\php.exe"
 
 if not exist "%PHP_EXE%" (
     echo PHP nao foi encontrado em %PHP_EXE%.
-    pause
     exit /b 1
 )
 
@@ -16,10 +20,7 @@ if not exist "%PHP_EXE%" (
 if errorlevel 1 (
     echo.
     echo A automacao rapida terminou com erro.
-    pause
     exit /b 1
 )
 
-echo.
-echo Automacao rapida finalizada com sucesso.
-pause
+exit /b 0

@@ -20,6 +20,7 @@ final class FastChromeAutomation
     private string $baseUrl;
     private ?string $sessionId = null;
     private string $logPath;
+    private string $chromeDriverStdoutLogPath;
 
     public function __construct()
     {
@@ -30,6 +31,7 @@ final class FastChromeAutomation
 
         $timestamp = date('Ymd_His');
         $this->logPath = FAST_LOG_DIR . DIRECTORY_SEPARATOR . 'automation_fast_' . $timestamp . '.log';
+        $this->chromeDriverStdoutLogPath = FAST_LOG_DIR . DIRECTORY_SEPARATOR . 'chromedriver_stdout_' . $timestamp . '.log';
     }
 
     public function run(): void
@@ -43,7 +45,6 @@ final class FastChromeAutomation
             $this->openUrl(FAST_LOGIN_URL);
             $this->windowsLogin();
             $this->openUrl(FAST_EMITIR_URL);
-            $this->focusFirstDateField();
             $this->typeFirstDayAndSearchWithKeyboard();
             $this->sendAllNotas();
             $this->saveScreenshot(__DIR__ . DIRECTORY_SEPARATOR . 'login_result.png');
@@ -65,7 +66,10 @@ final class FastChromeAutomation
         }
 
         $command =
-            'start "" /B "' . FAST_CHROMEDRIVER_EXE . '" --port=' . FAST_CHROMEDRIVER_PORT;
+            'start "" /B cmd /c ""' .
+            FAST_CHROMEDRIVER_EXE .
+            '" --port=' . FAST_CHROMEDRIVER_PORT .
+            ' > "' . $this->chromeDriverStdoutLogPath . '" 2>&1"';
         pclose(popen($command, 'r'));
 
         if (!$this->waitUntil(fn (): bool => $this->isResponsive(), 2)) {
@@ -110,31 +114,94 @@ final class FastChromeAutomation
     private function openUrl(string $url): void
     {
         $this->sessionRequest('POST', '/url', ['url' => $url]);
-        usleep(50000);
-        $this->executeScript('window.location.href = arguments[0];', [$url]);
-        usleep(50000);
+
+        $opened = $this->waitUntil(function () use ($url): bool {
+            $currentUrl = $this->getCurrentUrl();
+            if ($currentUrl === $url || str_contains($currentUrl, '/onneenfe/')) {
+                return true;
+            }
+
+            if ($currentUrl === '' || $currentUrl === 'data:,' || $currentUrl === 'about:blank') {
+                $this->executeScript('window.location.href = arguments[0];', [$url]);
+            }
+
+            return false;
+        }, 8);
+
+        if (!$opened) {
+            throw new RuntimeException('Nao foi possivel abrir a URL: ' . $url . '. Atual: ' . $this->getCurrentUrl());
+        }
+
+        usleep(150000);
         $this->log('URL aberta: ' . $url);
+    }
+
+    private function getCurrentUrl(): string
+    {
+        $result = $this->executeScript('return window.location.href;');
+        return is_string($result) ? $result : '';
     }
 
     private function windowsLogin(): void
     {
-        $this->log('Login por SendKeys');
-        $this->runPowerShell(<<<'POWERSHELL'
-Add-Type -AssemblyName Microsoft.VisualBasic
-$wshell = New-Object -ComObject WScript.Shell
-Start-Sleep -Milliseconds 50
-[Microsoft.VisualBasic.Interaction]::AppActivate('Onnee NF-e') | Out-Null
-Start-Sleep -Milliseconds 50
-$wshell.SendKeys('admin')
-Start-Sleep -Milliseconds 50
-$wshell.SendKeys('{TAB}')
-Start-Sleep -Milliseconds 50
-$wshell.SendKeys('admin')
-Start-Sleep -Milliseconds 50
-$wshell.SendKeys('{TAB}')
-Start-Sleep -Milliseconds 50
-$wshell.SendKeys('{ENTER}')
-POWERSHELL);
+        $this->log('Login por DOM');
+
+        $ready = $this->waitUntil(function (): bool {
+            $result = $this->executeScript(<<<'JS'
+return !!(document.getElementById('txt_user') && document.getElementById('txt_password') && document.getElementById('btn_entrar'));
+JS);
+            return $result === true;
+        }, 10);
+
+        if (!$ready) {
+            throw new RuntimeException('Campos de login nao ficaram disponiveis.');
+        }
+
+        $result = $this->executeScript(<<<'JS'
+function setValue(element, value) {
+  const descriptor =
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value') ||
+    Object.getOwnPropertyDescriptor(Object.getPrototypeOf(element), 'value');
+
+  element.focus();
+  if (descriptor && typeof descriptor.set === 'function') {
+    descriptor.set.call(element, value);
+  } else {
+    element.value = value;
+  }
+  element.dispatchEvent(new Event('input', { bubbles: true }));
+  element.dispatchEvent(new Event('change', { bubbles: true }));
+}
+
+function clickElement(element) {
+  if (!element) return false;
+  ['mouseover', 'mousedown', 'mouseup', 'click'].forEach((eventName) => {
+    element.dispatchEvent(new MouseEvent(eventName, { bubbles: true, cancelable: true, view: window }));
+  });
+  if (typeof element.click === 'function') {
+    element.click();
+  }
+  return true;
+}
+
+const user = document.getElementById('txt_user');
+const pass = document.getElementById('txt_password');
+const button = document.getElementById('btn_entrar');
+if (!user || !pass || !button) {
+  return { ok: false };
+}
+
+setValue(user, arguments[0]);
+setValue(pass, arguments[1]);
+clickElement(button);
+return { ok: true };
+JS, [FAST_USER, FAST_PASSWORD]);
+
+        if (!is_array($result) || ($result['ok'] ?? false) !== true) {
+            throw new RuntimeException('Falha no login por DOM.');
+        }
+
+        usleep(250000);
     }
 
     private function focusFirstDateField(): void
@@ -176,25 +243,56 @@ JS);
         $currentMonth = (int) date('n');
         $month = str_pad((string) ($currentMonth === 1 ? 12 : $currentMonth - 1), 2, '0', STR_PAD_LEFT);
         $year = date('Y');
-        $numericValue = '01' . $month . $year;
-        $this->log('Digitando filtro: ' . $numericValue);
+        $isoValue = $year . '-' . $month . '-01';
+        $this->log('Aplicando filtro por DOM: ' . $isoValue);
 
-        $this->runPowerShell(<<<POWERSHELL
-Add-Type -AssemblyName Microsoft.VisualBasic
-\$wshell = New-Object -ComObject WScript.Shell
-Start-Sleep -Milliseconds 80
-[Microsoft.VisualBasic.Interaction]::AppActivate('Onnee NF-e') | Out-Null
-Start-Sleep -Milliseconds 80
-\$wshell.SendKeys('^a')
-Start-Sleep -Milliseconds 30
-\$wshell.SendKeys('{BACKSPACE}')
-Start-Sleep -Milliseconds 30
-\$wshell.SendKeys('$numericValue')
-POWERSHELL);
+        $result = $this->executeScript(<<<'JS'
+function setValue(element, value) {
+  const descriptor =
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value') ||
+    Object.getOwnPropertyDescriptor(Object.getPrototypeOf(element), 'value');
 
-        usleep(50000);
+  element.focus();
+  if (descriptor && typeof descriptor.set === 'function') {
+    descriptor.set.call(element, value);
+  } else {
+    element.value = value;
+  }
+  element.dispatchEvent(new Event('input', { bubbles: true }));
+  element.dispatchEvent(new Event('change', { bubbles: true }));
+}
 
-        $this->clickSearchButton();
+function clickElement(element) {
+  if (!element) return false;
+  ['mouseover', 'mousedown', 'mouseup', 'click'].forEach((eventName) => {
+    element.dispatchEvent(new MouseEvent(eventName, { bubbles: true, cancelable: true, view: window }));
+  });
+  if (typeof element.click === 'function') {
+    element.click();
+  }
+  return true;
+}
+
+const dateInput = document.getElementById('ipt_dtInicial');
+const searchButton = document.getElementById('btn_pesquisar');
+if (!dateInput) {
+  return { ok: false, step: 'date_input_not_found' };
+}
+if (!searchButton) {
+  return { ok: false, step: 'search_button_not_found' };
+}
+
+setValue(dateInput, arguments[0]);
+clickElement(searchButton);
+return { ok: true };
+JS, [$isoValue]);
+
+        if (!is_array($result) || ($result['ok'] ?? false) !== true) {
+            $step = is_array($result) ? (string) ($result['step'] ?? 'unknown') : 'invalid';
+            throw new RuntimeException('Falha ao aplicar filtro. Etapa: ' . $step);
+        }
+
+        usleep(250000);
     }
 
     private function clickSearchButton(): void
@@ -220,6 +318,7 @@ function clickElement(element) {
 
 const buttons = Array.from(document.querySelectorAll('button, a'));
 const searchButton =
+  document.getElementById('btn_pesquisar') ||
   document.querySelector('button .fa-search')?.closest('button') ||
   buttons.find((element) => element.querySelector('.fa-search, .glyphicon-search')) ||
   buttons.find((element) => {
@@ -273,17 +372,8 @@ JS);
                 continue;
             }
 
-            $alreadyChecked = ($state['checked'] ?? false) === true;
-            if (!$alreadyChecked) {
-                $this->toggleFocusedCheckboxWithKeyboard();
-
-                if (!$this->isPreparedCheckboxChecked()) {
-                    $this->toggleFocusedCheckboxWithKeyboard();
-                }
-
-                if (!$this->isPreparedCheckboxChecked()) {
-                    throw new RuntimeException('Nao foi possivel marcar o checkbox da primeira NF.');
-                }
+            if (($state['checked'] ?? false) !== true) {
+                throw new RuntimeException('Nao foi possivel marcar o checkbox da primeira NF.');
             }
 
             $this->clickSendButton();
@@ -425,6 +515,7 @@ const firstCell =
   firstCheckbox.parentElement;
 
 clickElement(firstCheckbox);
+firstCheckbox.click();
 if (!firstCheckbox.checked) {
   clickElement(firstCell);
 }
@@ -435,6 +526,12 @@ if (!firstCheckbox.checked) {
   firstCheckbox.checked = true;
   firstCheckbox.dispatchEvent(new Event('input', { bubbles: true }));
   firstCheckbox.dispatchEvent(new Event('change', { bubbles: true }));
+}
+if (!firstCheckbox.checked && window.jQuery) {
+  window.jQuery(firstCheckbox).prop('checked', true).trigger('input').trigger('change').trigger('click');
+}
+if (!firstCheckbox.checked && rowContainer && window.jQuery) {
+  window.jQuery(rowContainer).find('input[type="checkbox"]').prop('checked', true).trigger('input').trigger('change');
 }
 
 return {
@@ -452,30 +549,6 @@ return {
 JS);
 
         return is_array($state) ? $state : ['done' => true, 'reason' => 'estado_invalido'];
-    }
-
-    private function toggleFocusedCheckboxWithKeyboard(): void
-    {
-        $this->log('Marcando checkbox por teclado');
-        $this->runPowerShell(<<<'POWERSHELL'
-Add-Type -AssemblyName Microsoft.VisualBasic
-$wshell = New-Object -ComObject WScript.Shell
-Start-Sleep -Milliseconds 60
-[Microsoft.VisualBasic.Interaction]::AppActivate('Onnee NF-e') | Out-Null
-Start-Sleep -Milliseconds 60
-$wshell.SendKeys(' ')
-POWERSHELL);
-        usleep(120000);
-    }
-
-    private function isPreparedCheckboxChecked(): bool
-    {
-        $result = $this->executeScript(<<<'JS'
-const target = document.querySelector('input[data-robo-target="1"]');
-return target ? target.checked === true : false;
-JS);
-
-        return $result === true;
     }
 
     private function clickSendButton(): void
@@ -666,27 +739,6 @@ JS);
         }
 
         return $decoded;
-    }
-
-    private function runPowerShell(string $script): void
-    {
-        $tempFile = tempnam(sys_get_temp_dir(), 'robo_fast_ps_');
-        if ($tempFile === false) {
-            throw new RuntimeException('Falha ao criar script temporario.');
-        }
-
-        $psFile = $tempFile . '.ps1';
-        @rename($tempFile, $psFile);
-        file_put_contents($psFile, $script);
-
-        $output = [];
-        $exitCode = 0;
-        exec('powershell -ExecutionPolicy Bypass -File ' . escapeshellarg($psFile) . ' 2>&1', $output, $exitCode);
-        @unlink($psFile);
-
-        if ($exitCode !== 0) {
-            throw new RuntimeException('Falha PowerShell: ' . implode(PHP_EOL, $output));
-        }
     }
 
     private function waitUntil(callable $condition, int $timeoutSeconds): bool
